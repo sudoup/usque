@@ -4,32 +4,91 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:  # Allows manual triggering
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'name tag/release version (example v4.1.0)'
+        required: true
+        default: 'v4.1.0'
+
+permissions:
+  contents: write
 
 jobs:
-  release:
-    name: Build and Release
+  build-and-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # Required for GitHub Releases
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.3
+          go-version-file: go.mod
 
-      - name: Install GoReleaser
+      - name: Determine release tag
+        id: tag
         run: |
-          curl -sL https://github.com/goreleaser/goreleaser/releases/latest/download/goreleaser_Linux_x86_64.tar.gz | tar xz -C /tmp
-          sudo mv /tmp/goreleaser /usr/local/bin/
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Run GoReleaser
+      - name: Build all targets
+        run: |
+          mkdir -p dist
+          build_one() {
+            local label="$1" goos="$2" goarch="$3" goarm="${4:-}"
+            local ext=""
+            [ "$goos" = "windows" ] && ext=".exe"
+            echo "::group::Building $label (GOOS=$goos GOARCH=$goarch GOARM=$goarm)"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "dist/usque-${label}${ext}" .
+            echo "::endgroup::"
+          }
+
+          build_one linux-amd64     linux   amd64
+          build_one linux-arm64     linux   arm64
+          build_one linux-armv5     linux   arm   5
+          build_one linux-armv6     linux   arm   6
+          build_one linux-armv7     linux   arm   7
+          build_one linux-mips      linux   mips
+          build_one linux-mipsle    linux   mipsle
+          build_one linux-mips64    linux   mips64
+          build_one linux-mips64le  linux   mips64le
+          build_one android-arm64   android arm64
+          build_one windows-amd64   windows amd64
+          build_one windows-arm64   windows arm64
+          build_one windows-386     windows 386
+          build_one darwin-amd64    darwin  amd64
+          build_one darwin-arm64    darwin  arm64
+
+      - name: Pack into zip archives
+        run: |
+          cd dist
+          for f in usque-*; do
+            zip -q "${f}.zip" "$f"
+            rm "$f"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.zip > checksums.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: usque-binaries
+          path: dist/
+
+      - name: Create GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: goreleaser release --clean
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.name }}" dist/*.zip dist/checksums.txt \
+            --title "${{ steps.tag.outputs.name }}" \
+            --generate-notes
